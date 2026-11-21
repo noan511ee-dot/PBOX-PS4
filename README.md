@@ -1,4 +1,10 @@
-# PBOX — PS4 Edition (Ravok / نواف العتيبي)
+<p align="center">
+  <img src="PBOX-logo.jpg" alt="PBOX logo" width="180">
+</p>
+
+<h1 align="center">PBOX</h1>
+<p align="center"><strong>Independent PS4 Cloud Gaming Client</strong></p>
+<p align="center">A lightweight native dashboard and streaming client for homebrew-enabled PlayStation 4 systems.</p>
 
 نسخة **PBOX** الخاصة بجهاز **PlayStation 4** لبث ألعاب Xbox السحابية (xCloud)، بإعداد وتطوير وتخصيص **نواف العتيبي (Ravok)**، مبنية فوق الأساس مفتوح المصدر المرخّص تحت **GPL-3.0**.
 
