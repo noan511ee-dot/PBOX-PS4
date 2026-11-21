@@ -6,6 +6,14 @@
 <p align="center"><strong>Independent PS4 Cloud Gaming Client</strong></p>
 <p align="center">A lightweight native dashboard and streaming client for homebrew-enabled PlayStation 4 systems.</p>
 
+## Overview
+
+PBOX is an independent PS4 cloud gaming client focused on a responsive native interface, reliable streaming, and practical controller support. It presents an Xbox-inspired Games dashboard with featured artwork, game details, a Play action, library browsing, console navigation, settings, and streaming diagnostics.
+
+PBOX is not an emulator. It does not emulate Xbox or PlayStation hardware, copy games, bypass cloud-service authentication, or distribute copyrighted game content. The client requests a streaming session from a supported cloud service and forwards the resulting video, audio, and input data to the PS4.
+
+The project is designed for a homebrew-enabled PS4 environment. A compatible PS4 firmware, a compatible homebrew environment such as GoldHEN, a supported cloud account, and a suitable streaming subscription may be required. Service availability, server region, account permissions, and network quality are outside the control of this repository.
+
 نسخة **PBOX** الخاصة بجهاز **PlayStation 4** لبث ألعاب Xbox السحابية (xCloud)، بإعداد وتطوير وتخصيص **نواف العتيبي (Ravok)**، مبنية فوق الأساس مفتوح المصدر المرخّص تحت **GPL-3.0**.
 
 ## حقوق النسخة والتطوير
