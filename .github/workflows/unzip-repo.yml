@@ -1,0 +1,33 @@
+name: Extract Repo Zip
+
+on:
+  push:
+    branches: [ main, master ]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  unzip:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Extract uploaded zip
+        shell: bash
+        run: |
+          ZIP_FILE="PBOX-PS4-Ravok-Edition-v3.zip"
+          if [ -f "$ZIP_FILE" ]; then
+            unzip -o "$ZIP_FILE" -x ".github/workflows/*"
+            rm -f "$ZIP_FILE"
+            git config user.name "github-actions[bot]"
+            git config user.email "github-actions[bot]@users.noreply.github.com"
+            git add -A
+            git commit -m "Extract repository archive" || true
+            git push
+          else
+            echo "Zip file not found: $ZIP_FILE"
+            exit 1
+          fi
