@@ -1,0 +1,917 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 RafaelNGP
+#include "app/worker_internal.h"
+
+#include "app/launch_title_internal.h"
+#include "app/autoplay.h"
+#include "app/crash_guard.h"
+#include "app/shell.h"
+#include "app/stream_player.h"
+#include "app/stream_metrics.h"
+#include "display/display.h"
+#include "input/controller.h"
+#include "media/audio_out.h"
+#include "media/audio_queue.h"
+#include "platform/platform.h"
+#include "ui/cloud_time.h"
+#include "ui/strings.h"
+#include "util/log.h"
+#include "xcloud/catalog.h"
+#include "xcloud/regions.h"
+#include "trophy/trophy_sync.h"
+#include "trophy/trophy_registry.h"
+
+#include <algorithm>
+#include <atomic>
+#include <cmath>
+#include <cstdio>
+#include <cstdlib>
+#include <cstdint>
+#include <iterator>
+#include <map>
+#include <mutex>
+#include <string>
+#include <vector>
+
+namespace xc::app {
+
+namespace {
+
+struct RegionRttSample {
+    int ms = 0;
+    uint64_t measuredAtMs = 0;
+};
+
+std::mutex g_sessionRegionRttMutex;
+std::map<std::string, RegionRttSample> g_sessionRegionRtt;
+constexpr uint64_t kRegionRttSampleMaxAgeMs = 30u * 60u * 1000u;
+
+void rememberSessionRegionRtt(const std::string& region, int ms, uint64_t now) {
+    if (region.empty() || ms <= 0) return;
+    std::lock_guard<std::mutex> lock(g_sessionRegionRttMutex);
+    g_sessionRegionRtt[region] = {ms, now};
+}
+
+std::string lowestRecentSessionRegion(const std::string& defaultRegion, const std::vector<std::string>& available,
+                                      uint64_t now) {
+    std::map<std::string, int> measured;
+    {
+        std::lock_guard<std::mutex> lock(g_sessionRegionRttMutex);
+        for (const auto& name : available) {
+            const auto it = g_sessionRegionRtt.find(name);
+            if (it != g_sessionRegionRtt.end() && it->second.ms > 0 && now >= it->second.measuredAtMs &&
+                now - it->second.measuredAtMs <= kRegionRttSampleMaxAgeMs)
+                measured.emplace(name, it->second.ms);
+        }
+    }
+    // A comparison needs an actual reading for the service default and at
+    // least one alternative; estimated network-test values are never used.
+    return xcloud::lowestMeasuredRegion(defaultRegion, available, measured, 8);
+}
+
+std::string formatWait(int seconds) {
+    if (seconds < 0) return "...";
+    if (seconds < 60) return std::to_string(seconds) + " s";
+    return std::to_string((seconds + 59) / 60) + " min";
+}
+
+}  // namespace
+
+void playQueueReadyAlert(bool notifyToast) {
+    // 1. DualSense rumble pulse
+    input::setRumble(180, 180, 500, 0);
+
+    // 2. Synthesize a pleasant 3-tone harmonic chime (E5 -> G#5 -> B5, E Major triad)
+    constexpr int kRate = 48000;
+    constexpr float kPi = 3.14159265358979323846f;
+    struct Tone {
+        float freq;
+        int ms;
+    };
+    const Tone tones[3] = {
+        {659.25f, 100}, // E5
+        {830.61f, 100}, // G#5
+        {987.77f, 220}  // B5
+    };
+
+    std::vector<float> pcm;
+    pcm.reserve(kRate * 2);
+    for (int t = 0; t < 3; ++t) {
+        int frames = (kRate * tones[t].ms) / 1000;
+        float freq = tones[t].freq;
+        float decayRate = (t == 2) ? 6.0f : 4.0f;
+        for (int i = 0; i < frames; ++i) {
+            float sec = static_cast<float>(i) / static_cast<float>(kRate);
+            float attack = std::min(1.0f, sec / 0.005f);
+            float decay = std::exp(-decayRate * sec);
+            float env = attack * decay * 0.70f;
+            float s = std::sin(2.0f * kPi * freq * sec) + 0.25f * std::sin(4.0f * kPi * freq * sec);
+            float sample = s * env;
+            pcm.push_back(sample); // Left
+            pcm.push_back(sample); // Right
+        }
+    }
+
+    // Play directly through the DualSense controller speaker (falls back to main audio)
+    media::playPadSpeakerAudio(pcm.data(), pcm.size() / 2);
+
+    // 3. System notification toast (only when stream queue actually finishes)
+    if (notifyToast) {
+        platform::notify(ui::tr(ui::Str::QueueReadyAlert));
+    }
+}
+
+namespace {
+
+// Streams until the player ends or the user leaves; returns a status line.
+// The cloud title being played, for crash markers (set by play()).
+std::string g_stageTitle;
+std::string g_stageGameName;
+std::string g_stageProduct;
+std::string g_stageXboxTitleId;
+std::string g_stageTileUrl;
+
+std::string stream(xcloud::GssvClient& gssv, const auth::CloudTimeQuery& cloudQuery) {
+    crash::setStage(gssv.isHome() ? "streaming own Xbox" : ("streaming " + g_stageTitle).c_str());
+    g_gameClosedOnServer = false;
+    app::StreamPlayer player(gssv);
+    if (g_autoplay.dump) player.dumpVideo(platform::dataDir() + "/stream.aus", g_autoplay.seconds + 15);
+    // Keep the v1.6.9 low-latency default. An explicit test/autoplay setting
+    // may still select frame threading; forcing extra threads on every PS4
+    // can increase jitter when the stream falls back from hardware decode.
+    player.setDecodeThreads(g_autoplay.decodeThreads);
+    player.setSimulatedLoss(g_autoplay.videoLoss);
+    player.setHwDecodeProbe(g_autoplay.hwDecode);
+    {
+        std::lock_guard<std::mutex> lock(g_settingsMutex);
+        bool hasCustom = false;
+        GameProfile prof = g_settings.profileForGame(g_stageProduct, g_stageTitle, &hasCustom);
+        bool preferHw = true;
+        if (g_autoplay.swDecode) {
+            preferHw = false;
+        } else if (g_autoplay.preferHwDecode) {
+            preferHw = (hasCustom ? (prof.videoDecoder == 0) : (g_settings.videoDecoder == 0));
+        } else {
+            preferHw = false;
+        }
+        if (g_settings.performanceMode != 0) preferHw = true;
+        player.setPreferHwDecode(preferHw);
+        XC_LOGI("stream: video decoder %s", preferHw ? "hardware preferred" : "software (CPU)");
+        player.setMicGain(g_settings.micGainFactor());
+        player.setMicEnabled(g_settings.micEnabled);
+        player.setLegacyTuning(g_autoplay.legacy);
+        int cap = g_autoplay.bitrateMbps > 0 ? g_autoplay.bitrateMbps : g_settings.maxBitrateMbps;
+        if (g_autoplay.bitrateMbps <= 0 && g_settings.performanceMode == 1) cap = cap > 0 ? std::min(cap, 8) : 8;
+        if (g_autoplay.bitrateMbps <= 0 && g_settings.performanceMode == 2) cap = cap > 0 ? std::min(cap, 13) : 13;
+        player.setMaxBitrate(cap);
+        media::audioSetVolume(g_settings.gameVolume / 100.0f);
+        XC_LOGI("stream: bitrate cap %s, game volume %d%%",
+                cap ? (std::to_string(cap) + " Mbps").c_str() : "automatic",
+                g_settings.gameVolume);
+        media::audioSetRoute(static_cast<media::AudioRoute>(g_settings.audioRoute));
+        media::audioSetVoiceRouting(g_settings.voiceRouting);
+        int hapticLvl = hasCustom ? prof.audioHaptics : g_settings.audioHaptics;
+        media::setAudioHapticsLevel(hapticLvl);
+    }
+    std::string err;
+    if (!player.start(err)) {
+        player.stop();  // wakes and joins any media thread that started before the failure
+        return "ERROR: " + ui::trf(ui::Str::StreamFailed, err);
+    }
+    {
+        std::lock_guard<std::mutex> lock(g_playerMutex);
+        g_player = &player;
+    }
+    g_ui->showStreaming();
+    {
+        // The touchpad's gestures, in the first three streams only.
+        std::lock_guard<std::mutex> lock(g_settingsMutex);
+        if (g_settings.gestureHints < 3) {
+            ++g_settings.gestureHints;
+            g_settings.save(settingsPath());
+            // (Without a touchpad: the buttons and keys that do the same.)
+            platform::notify(ui::tr(g_ui->caps().touchpad ? ui::Str::GestureHint : ui::Str::GestureHintButtons));
+        }
+    }
+
+    const uint64_t started = platform::nowMs();
+    uint64_t nextTick = started;
+    // The account's cloud time (a limited account's, in the cloud): counted
+    // down for the game menu, a notice at 15 and at 5 minutes left (Xbox
+    // ends the stream at none, issue #342), and the service asked again every
+    // 10 minutes from a thread of its own (the loop never waits on it).
+    ui::CloudTimeClock cloud;
+    const bool cloudTest = g_autoplay.cloudLeft >= 0;
+    if (!gssv.isHome()) cloud.start(cloudTest ? g_autoplay.cloudLeft : s_playtimeRemainingSeconds, started);
+    if (cloud.limited()) XC_LOGI("cloud time: %s left at the start", ui::formatCloudTime(cloud.left(started)).c_str());
+    struct CloudAsk {
+        platform::Thread thread;
+        std::atomic<bool> done{false};
+        std::atomic<int64_t> remaining{-1};
+    } ask;
+    const uint64_t kAskEveryMs = cloudTest ? 20000 : 600000;
+    uint64_t nextAsk = started + kAskEveryMs;
+    auto cloudTimeStep = [&](uint64_t nowMs) {
+        if (!cloud.limited()) return;
+        if (const int64_t due = cloud.noticeDue(nowMs); due > 0)
+            platform::notify(ui::trf(ui::Str::CloudTimeWarn, ui::formatCloudTime(due)),
+                             "cloud time: " + ui::formatCloudTime(due) + " left (notification)");
+        if (ask.done) {
+            ask.thread.join();
+            ask.done = false;
+            const int64_t counted = cloud.left(nowMs);
+            cloud.answer(ask.remaining, nowMs);
+            XC_LOGI("cloud time: the service says %s, counted %s: %s left",
+                    ask.remaining < 0 ? "no limit or nothing" : ui::formatCloudTime(ask.remaining).c_str(),
+                    ui::formatCloudTime(counted).c_str(), ui::formatCloudTime(cloud.left(nowMs)).c_str());
+        }
+        if (!ask.thread.joinable() && nowMs >= nextAsk && !cloudQuery.marketplace.token.empty()) {
+            nextAsk = nowMs + kAskEveryMs;
+            platform::startThread(ask.thread, [&ask, cloudQuery] {
+                auth::ContentAccessPlaytime t;
+                ask.remaining = auth::queryCloudTime(cloudQuery, t, 8000) ? t.accountRemaining : -1;
+                ask.done = true;
+            }, 1u << 20);
+        }
+    };
+    uint64_t lastTrophyPollAt = started;
+    bool snapshot1 = false, snapshot2 = false, snapshot3 = false, snapshot4 = false;
+    uint64_t nextPeriodicShot = 150000;
+    int periodicShotIdx = 5;
+    bool autoplayDone = false;
+    int bestRtt = -1;  // lowest round trip seen: the region's latency
+    int tallest = 0;   // the tallest picture seen (the probe's measure)
+    // The connection's state for the warning and the end-of-session summary:
+    // a second is bad when the jitter buffer dropped a frame (lost for good),
+    // no video arrived at all, or the round trip went far above the best seen.
+    // Not the frame rate: games send fewer frames in some scenes.
+    uint64_t degradedUntil = 0, lastTickAt = 0, degradedStreakSeconds = 0;
+    bool degradedLogged = false;
+    bool autoResolutionReduced = false;
+    uint64_t lastAutoResolutionChangeMs = 0;
+    uint32_t reconnectsSeen = 0;
+    struct {
+        uint64_t seconds = 0, badSeconds = 0, kbps = 0, rttSum = 0, rttCount = 0;
+    } session;
+    uint64_t prevPlaytime = 0;
+    {
+        std::lock_guard<std::mutex> lock(g_settingsMutex);
+        prevPlaytime = g_settings.playtimeForGame(g_stageProduct, g_stageTitle);
+    }
+    bool probeDone = !g_probing;
+    auto recordProbe = [&] {
+        probeDone = true;
+        if (tallest <= 0) return;
+        std::lock_guard<std::mutex> lock(g_settingsMutex);
+        (gssv.isHome() ? g_settings.maxHeightHome : g_settings.maxHeightCloud) = tallest;
+        (gssv.isHome() ? g_settings.probedHome : g_settings.probedCloud) = auth::unixNow();
+        g_settings.save(settingsPath());
+        g_ui->setAllow1440(allow1440Locked());
+        XC_LOGI("resolution probe (%s): %dp at most", gssv.isHome() ? "own Xbox" : "cloud", tallest);
+    };
+    app::StreamPlayer::Stats last{};
+    uint64_t nextSnapCheck = 0;
+    // A watch on this loop (issue #317: a PS4 stream froze for good with no
+    // line logged, the "no video" check never firing): past 5 s without a
+    // pass, which step it is stuck in goes into the log, once a stall.
+    struct LoopWatch {
+        std::atomic<const char*> step{"start"};
+        std::atomic<uint64_t> beatMs{platform::nowMs()};
+        std::atomic<bool> stop{false};
+        platform::Thread thread;
+        void run() {
+            bool told = false;
+            while (!stop) {
+                for (int i = 0; i < 10 && !stop; ++i) platform::sleepMs(100);
+                const uint64_t idle = platform::nowMs() - beatMs.load();
+                if (idle > 5000 && !told) {
+                    XC_LOGW("stream loop: stuck for %llu ms in \"%s\"", static_cast<unsigned long long>(idle), step.load());
+                    told = true;
+                } else if (idle <= 5000 && told) {
+                    XC_LOGW("stream loop: going again after \"%s\"", step.load());
+                    told = false;
+                }
+            }
+        }
+    } watch;
+    platform::startThread(watch.thread, [&watch] { watch.run(); }, 64u << 10);
+    auto beat = [&watch](const char* step) {
+        watch.step = step;
+        watch.beatMs = platform::nowMs();
+    };
+    // A/B tests in one stream (autoplay "abcycle=N"): every N s the next
+    // condition, so all of them share the queue wait, the game and the network.
+    struct AbCondition {
+        const char* name;
+        bool mailbox, hardware, restore;
+    };
+    static constexpr AbCondition kAb[] = {{"new", true, true, true},
+                                          {"fifo", false, true, true},
+                                          {"sw", true, false, true},
+                                          {"old", false, false, true},
+                                          {"norestore", true, true, false}};
+    int abIndex = -1;
+    bool abHardware = true;
+    uint64_t abNext = started + 20000;
+    while (player.running() && !g_cancel) {
+        beat("loop");
+        uint64_t elapsed = platform::nowMs() - started;
+        if (g_autoplay.abCycleSec > 0 && started + elapsed >= abNext) {
+            abIndex = (abIndex + 1) % static_cast<int>(std::size(kAb));
+            const AbCondition& c = kAb[abIndex];
+            display::setLowLatencyPresent(c.mailbox);
+            display::setRestore(c.restore);
+            if (c.hardware != abHardware || abIndex == 0) player.switchDecoder(c.hardware);
+            abHardware = c.hardware;
+            abNext = started + elapsed + static_cast<uint64_t>(g_autoplay.abCycleSec) * 1000u;
+            XC_LOGI("AUTOPLAY AB: condition %s", c.name);
+        }
+        beat("the cloud time");
+        cloudTimeStep(started + elapsed);
+        if (!g_autoplay.title.empty()) {
+            if (elapsed >= static_cast<uint64_t>(g_autoplay.seconds) * 1000u) {
+                autoplayDone = true;
+                break;
+            }
+            if (!snapshot1 && elapsed >= 10000) {
+                snapshot1 = true;
+                player.requestSnapshot(platform::dataDir() + "/frame.ppm");
+            }
+            bool press = !g_autoplay.idle &&
+                         ((elapsed >= 22000 && elapsed < 22300) ||
+                          (elapsed >= 26000 && elapsed < 26300) ||
+                          (elapsed >= 70000 && (elapsed % 6000 < 300)));
+            if (g_autoplay.fnPlay) {
+                // Fortnite: nothing pressed for 150 s (the match is reached by
+                // hand, through the web gamepad, as Fortnite's lobby and its
+                // pop-ups change from one session to the next); then the
+                // camera keeps turning and the player runs for 4 s of every 10
+                // and jumps: motion like a game's, the same each run.
+                press = false;
+                const bool moving = elapsed >= 150000;
+                const float t = static_cast<float>(elapsed % 8000) / 8000.0f;
+                g_syntheticRightX = moving ? 0.7f * std::sin(t * 6.2831853f) : 0.0f;
+                g_syntheticLeftY = moving && elapsed % 10000 < 4000 ? -1.0f : 0.0f;
+                if (moving && elapsed % 10000 >= 4000 && elapsed % 10000 < 4200) press = true;
+            }
+            if (press != g_syntheticA.exchange(press)) XC_LOGI("autoplay: A %s", press ? "down" : "up");
+            static bool dropped = false;
+            if (g_autoplay.dropTest && !dropped && elapsed >= 20000) {
+                dropped = true;
+                player.simulateDrop();
+            }
+            if (!snapshot2 && elapsed >= 28000) {
+                snapshot2 = true;
+                player.requestSnapshot(platform::dataDir() + "/frame2.ppm");
+            }
+            if (!snapshot3 && elapsed >= 70000) {
+                snapshot3 = true;
+                player.requestSnapshot(platform::dataDir() + "/frame3.ppm");
+            }
+            if (!snapshot4 && elapsed >= 110000) {
+                snapshot4 = true;
+                player.requestSnapshot(platform::dataDir() + "/frame4.ppm");
+            }
+            static bool imageTested = false;
+            if (g_autoplay.imgTest && !imageTested && elapsed + 25000 >= static_cast<uint64_t>(g_autoplay.seconds) * 1000u) {
+                imageTested = true;
+                player.requestImageTest();
+            }
+            // A capture asked for from outside (the file snap.req appears): now.ppm.
+            if (elapsed >= nextSnapCheck) {
+                nextSnapCheck = elapsed + 500;
+                const std::string req = platform::dataDir() + "/snap.req";
+                std::string unused;
+                if (platform::readFile(req, unused)) {
+                    std::remove(req.c_str());
+                    player.requestSnapshot(platform::dataDir() + "/now.ppm");
+                }
+            }
+            if (elapsed >= nextPeriodicShot) {
+                nextPeriodicShot = elapsed + 30000;
+                player.requestSnapshot(platform::dataDir() + "/frame" + std::to_string(periodicShotIdx++) + ".ppm");
+            }
+        }
+        if (platform::nowMs() >= nextTick) {
+            uint64_t tickNow = platform::nowMs();
+            double dt = lastTickAt ? (tickNow - lastTickAt) / 1000.0 : 1.0;
+            nextTick = tickNow + 1000;
+            beat("player.tick (reconnects, keyframe requests)");
+            player.tick();
+            beat("player.stats (counters, round trip)");
+            auto st = player.stats();
+            beat("the stats line");
+            XC_LOGI("stream: %llu access units, %llu decoded, %llu shown, %llu skipped, %llu failed, %llu resets, %llu kf req, "
+                    "%llu queued, %llu audio; rtp %llu pkts, %llu lost, %llu recovered, %llu nacks, "
+                    "%llu frames dropped; %llu kbps (remb %llu); %llu rumble; decode %.1f/%.1f ms (%s), draw %.1f/%.1f ms, %llu late; "
+                    "rtt %d ms; %dx%d; on screen %.1f/%.1f ms after arrival; qp %.1f; packets %llu ms apart at most, "
+                    "%llu frames at once, a frame %llu ms late; first packet to screen %.1f/%.1f ms",
+                    static_cast<unsigned long long>(st.videoFrames), static_cast<unsigned long long>(st.decodedFrames),
+                    static_cast<unsigned long long>(st.shownFrames), static_cast<unsigned long long>(st.droppedFrames),
+                    static_cast<unsigned long long>(st.decodeFailures),
+                    static_cast<unsigned long long>(st.queueResets), static_cast<unsigned long long>(st.keyframeRequests),
+                    static_cast<unsigned long long>(st.queued), static_cast<unsigned long long>(st.audioPackets),
+                    static_cast<unsigned long long>(st.rtpPackets), static_cast<unsigned long long>(st.rtpLost),
+                    static_cast<unsigned long long>(st.rtpRecovered), static_cast<unsigned long long>(st.rtpNacks),
+                    static_cast<unsigned long long>(st.rtpDroppedFrames), static_cast<unsigned long long>(st.rtpKbps),
+                    static_cast<unsigned long long>(st.rembKbps), static_cast<unsigned long long>(st.vibrations),
+                    st.decodeAvgUs / 1000.0, st.decodeMaxUs / 1000.0, st.isHwDecode ? "HW" : "SW",
+                    st.drawAvgUs / 1000.0, st.drawMaxUs / 1000.0,
+                    static_cast<unsigned long long>(st.lateFrames), st.rttMs, st.width, st.height,
+                    st.displayAvgUs / 1000.0, st.displayMaxUs / 1000.0, st.qpAvg,
+                    static_cast<unsigned long long>(st.rtpGapMs), static_cast<unsigned long long>(st.rtpBurst),
+                    static_cast<unsigned long long>(st.rtpLateMs), st.glassAvgUs / 1000.0, st.glassMaxUs / 1000.0);
+            if (st.rttMs > 0 && (bestRtt < 0 || st.rttMs < bestRtt)) bestRtt = st.rttMs;
+            tallest = std::max(tallest, st.height);
+            if (!probeDone && platform::nowMs() - started >= 20000) {
+                recordProbe();
+                if (!g_afterProbeAlias.empty() && !g_tierPicked) player.requestResolution(g_afterProbeAlias);
+            }
+            if (tickNow - lastTrophyPollAt >= 20000 && !g_stageXboxTitleId.empty()) {
+                lastTrophyPollAt = tickNow;
+                bool syncTrophies = false;
+                {
+                    std::lock_guard<std::mutex> lock(g_settingsMutex);
+                    syncTrophies = g_settings.syncTrophies;
+                    if (syncTrophies) {
+                        bool hasCustom = false;
+                        GameProfile prof = g_settings.profileForGame(g_stageProduct, g_stageTitle, &hasCustom);
+                        if (hasCustom && !prof.syncTrophies) {
+                            syncTrophies = false;
+                        }
+                    }
+                }
+                if (syncTrophies) {
+                    std::string xblAuth, xuid;
+                    {
+                        std::lock_guard<std::mutex> lock(g_argMutex);
+                        xblAuth = g_xblAuth;
+                        xuid = g_xuid;
+                    }
+                    if (!xblAuth.empty()) {
+                        trophy::dispatchStreamPoll(xblAuth, xuid, g_stageXboxTitleId,
+                                                   g_stageGameName.empty() ? g_stageTitle : g_stageGameName,
+                                                   g_stageTileUrl);
+                    }
+                }
+            }
+            {
+                ui::StreamInfo info;
+                info.region = ui::prettyRegion(gssv.region().name);
+                info.rttMs = st.rttMs;
+                info.fps = shownFps(st.shownFrames, last.shownFrames, dt);
+                info.mbps = st.rtpKbps / 1000.0;
+                // RTP receiver counters restart when the stream reconnects;
+                // avoid unsigned underflow producing a false 100%+ loss spike.
+                uint64_t lost = counterDelta(st.rtpLost, last.rtpLost);
+                uint64_t got = counterDelta(st.rtpPackets, last.rtpPackets);
+                info.lossPct = got + lost ? 100.0 * lost / (got + lost) : 0;
+                info.decodeMs = st.decodeAvgUs / 1000.0;
+                info.isHwDecode = st.isHwDecode;
+                info.onScreenMs = st.displayAvgUs / 1000.0;
+                info.width = st.width;
+                info.height = st.height;
+                info.qp = st.qpAvg;
+                if (last.decodedFrames > 0) {  // once the picture is running
+                    // A reconnect creates a new receiver and resets its counters.
+                    // Treat a lower counter as a new baseline; unsigned subtraction
+                    // would otherwise turn it into an enormous false drop burst.
+                    uint64_t dropped = st.rtpDroppedFrames >= last.rtpDroppedFrames
+                                           ? st.rtpDroppedFrames - last.rtpDroppedFrames
+                                           : 0;
+                    uint64_t localDropped = counterDelta(st.droppedFrames, last.droppedFrames);
+                    uint64_t localLate = counterDelta(st.lateFrames, last.lateFrames);
+                    bool localOverload = localVideoOverloaded(localDropped, localLate, st.decodeAvgUs, st.drawAvgUs);
+                    uint64_t now = platform::nowMs();
+                    // No video for a second; or the loop itself held up (a
+                    // reconnection blocks it) / a new session after a drop.
+                    bool stalled = st.videoFrames == last.videoFrames || (lastTickAt && now - lastTickAt > 2500) ||
+                                   player.reconnects() != reconnectsSeen;
+                    reconnectsSeen = player.reconnects();
+                    bool slow = st.rttMs > 0 && bestRtt > 0 && st.rttMs > bestRtt + 60;
+                    if (dropped || stalled || slow || localOverload) {
+                        ++degradedStreakSeconds;
+                        if (!degradedLogged)  // once per episode
+                            XC_LOGW("stream degraded: %llu RTP lost, %llu local dropped, %llu late, decode %.1f ms, draw %.1f ms; %s; rtt %d ms (best %d)",
+                                    static_cast<unsigned long long>(dropped),
+                                    static_cast<unsigned long long>(localDropped),
+                                    static_cast<unsigned long long>(localLate),
+                                    st.decodeAvgUs / 1000.0, st.drawAvgUs / 1000.0,
+                                    stalled ? "video stalled" : (slow ? "RTT elevated" : "video path under pressure"),
+                                    st.rttMs, bestRtt);
+                        degradedLogged = true;
+                        degradedUntil = now + 3000;
+                        ++session.badSeconds;
+                        // A sustained degradation on mobile networks is better handled by
+                        // asking the server for its 720 tier than by letting the decoder
+                        // accumulate old 1080 frames. This uses the existing
+                        // userRequestedResolutionUpdate protocol and is rate-limited.
+                        if (!autoResolutionReduced && gssv.resolution() != xcloud::Resolution::P720 &&
+                            degradedStreakSeconds >= 3 && now - lastAutoResolutionChangeMs >= 15000) {
+                            player.requestResolution("720");
+                            autoResolutionReduced = true;
+                            lastAutoResolutionChangeMs = now;
+                            XC_LOGW("adaptive resolution: network degraded for %llu consecutive s; requested 720 tier",
+                                    static_cast<unsigned long long>(degradedStreakSeconds));
+                        }
+                    } else {
+                        degradedStreakSeconds = 0;
+                        if (now >= degradedUntil) degradedLogged = false;
+                    }
+                    info.degraded = now < degradedUntil;
+                    lastTickAt = tickNow;
+                    ++session.seconds;
+                    session.kbps += st.rtpKbps;
+                    if (st.rttMs > 0) session.rttSum += static_cast<uint64_t>(st.rttMs), ++session.rttCount;
+                }
+                info.cloudTimeSeconds = cloud.left(platform::nowMs());
+                info.playtimeSeconds = prevPlaytime + session.seconds;
+                player.getRecentFrametimes(info.frametimes);
+                std::lock_guard<std::mutex> lock(g_infoMutex);
+                g_streamInfo = info;
+                ++g_infoSeq;
+            }
+            last = st;
+        }
+        beat("sleep");
+        platform::sleepMs(100);
+    }
+    watch.stop = true;
+    if (watch.thread.joinable()) watch.thread.join();
+    if (ask.thread.joinable()) ask.thread.join();  // 8 s at most
+    if (cloud.limited()) {
+        if (ask.done) cloud.answer(ask.remaining, platform::nowMs());
+        if (!cloudTest) s_playtimeRemainingSeconds = cloud.left(platform::nowMs());
+        XC_LOGI("cloud time: %s left at the end", ui::formatCloudTime(cloud.left(platform::nowMs())).c_str());
+    }
+    {
+        std::lock_guard<std::mutex> lock(g_playerMutex);
+        g_player = nullptr;
+    }
+    if (!probeDone && player.stats().decodedFrames > 0) recordProbe();  // a short stream still measured
+    std::string reason = g_cancel ? "left the game" : autoplayDone ? "autoplay finished" : player.endReason();
+    player.stop();
+    {
+        std::lock_guard<std::mutex> lock(g_settingsMutex);
+        media::setAudioHapticsLevel(g_settings.audioHaptics);
+    }
+    if (session.seconds >= 5 && (!g_stageTitle.empty() || !g_stageProduct.empty())) {
+        std::lock_guard<std::mutex> lock(g_settingsMutex);
+        uint64_t newTotal = prevPlaytime + session.seconds;
+        if (!g_stageTitle.empty()) g_settings.titlePlaytime[g_stageTitle] = newTotal;
+        if (!g_stageProduct.empty()) g_settings.titlePlaytime[g_stageProduct] = newTotal;
+        g_settings.save(settingsPath());
+        if (g_ui) g_ui->setSettings(ui::choiceFromSettings(g_settings));
+        XC_LOGI("playtime: updated for %s (%s) to %llu seconds (%s)", g_stageTitle.c_str(),
+                g_stageProduct.c_str(), static_cast<unsigned long long>(newTotal),
+                ui::formatPlaytime(newTotal).c_str());
+
+        std::shared_ptr<app::Library> lib;
+        {
+            std::lock_guard<std::mutex> lockLib(s_libraryMutex);
+            lib = s_library;
+        }
+        if (lib) {
+            if (!g_stageProduct.empty()) lib->recordRecent(g_stageProduct);
+            else if (!g_stageTitle.empty()) lib->recordRecent(g_stageTitle);
+            lib->setPlaytime(g_settings.titlePlaytime);
+            g_ui->setRows(lib->rows());
+            g_ui->setOwned(lib->owned(), lib->purchasable(), lib->ownedKnown());
+        }
+    }
+    if (bestRtt > 0) {
+        // Remembered per region: Settings shows it, the region fallback uses it.
+        std::map<std::string, int> rtt;
+        {
+            std::lock_guard<std::mutex> lock(g_settingsMutex);
+            g_settings.regionRtt[gssv.region().name] = bestRtt;
+            g_settings.save(settingsPath());
+            rtt = g_settings.regionRtt;
+        }
+        rememberSessionRegionRtt(gssv.region().name, bestRtt, platform::nowMs());
+        XC_LOGI("region %s: %d ms round trip", gssv.region().name.c_str(), bestRtt);
+        g_ui->setRegionLatency(rtt);
+    }
+    auto st = player.stats();
+    if (session.seconds >= 10) {
+        // The session in one line: the log (and so a report) and a notification.
+        double lossPct = st.rtpPackets + st.rtpLost ? 100.0 * (st.rtpLost - std::min(st.rtpRecovered, st.rtpLost)) /
+                                                          static_cast<double>(st.rtpPackets + st.rtpLost)
+                                                    : 0;
+        char details[160];
+        std::snprintf(details, sizeof details, "%llu min, %dp, %.1f Mbps, %.2f%% lost, %d ms",
+                      static_cast<unsigned long long>((session.seconds + 30) / 60), tallest,
+                      session.kbps / 1000.0 / static_cast<double>(session.seconds), lossPct,
+                      session.rttCount ? static_cast<int>(session.rttSum / session.rttCount) : -1);
+        XC_LOGI("session summary: %s; %llu s with a degraded connection, %llu frames lost, %llu recovered packets",
+                details, static_cast<unsigned long long>(session.badSeconds),
+                static_cast<unsigned long long>(st.rtpDroppedFrames), static_cast<unsigned long long>(st.rtpRecovered));
+    }
+    // An abnormal stream end (connection lost, WebRTC failure, decoder failure):
+    // report it as an error so the user sees the error screen and can report or retry.
+    bool normalEnd = g_cancel || autoplayDone || reason == "stopped" ||
+                     reason.find("KickForStopCommand") != std::string::npos ||
+                     reason.find("KickByNewSession") != std::string::npos ||
+                     reason.find("KickForServerShutdown") != std::string::npos ||
+                     reason.find("KickForBeingIdle") != std::string::npos;
+    if (!normalEnd) {
+        g_gameClosedOnServer = reason.rfind("the game closed on the server", 0) == 0;
+        return "ERROR: " + ui::trf(ui::Str::StreamFailed, reason);
+    }
+    return "Stream ended (" + reason + "), " + std::to_string(st.decodedFrames) + " frames shown";
+}
+
+// Queue -> /connect -> Provisioned -> stream. Returns a status line; sets
+// `failed` when the user should see an error rather than the home screen.
+// `regionName` overrides the settings' region (empty: as set).
+
+}  // namespace
+
+static std::string playUsingClient(auth::AuthManager& am, xcloud::GssvClient& gssv, const ui::GameTile& game,
+                                   bool& failed, const std::string& regionName) {
+    failed = true;
+    // A home session's id is the console's: only its start in the log.
+    XC_LOGI("starting %s (%s)", gssv.isHome() ? "own Xbox" : game.name.c_str(),  // not the console's name
+            gssv.isHome() ? (game.titleId.substr(0, 4) + "...").c_str() : game.titleId.c_str());
+    g_ui->showLaunching(game, regionName.empty() ? ui::tr(ui::Str::Connecting)
+                                                 : ui::trf(ui::Str::TryingRegion, ui::prettyRegion(regionName)));
+    std::string err;
+    // A login about to expire is renewed first (its region kept); if that
+    // fails the start is tried all the same.
+    if (!keepSignedIn(am, gssv, err)) XC_LOGW("sign-in renewal: %s", err.c_str());
+    std::string launchTitleId = game.titleId;
+    if (!gssv.isHome() && !game.productId.empty() && launchTitleId == game.productId)
+        launchTitleId.clear();  // A Store ProductId is not a cloud launch ID.
+    if (!gssv.isHome() && isUnverifiedGtaViLaunchId(game.productId, launchTitleId)) {
+        XC_LOGW("ignoring seeded GTA VI launch label; resolving only from Xbox cloud/catalog data");
+        launchTitleId.clear();
+    }
+    if (!gssv.isHome() && (launchTitleId.empty() || launchTitleId == "None") && !game.productId.empty()) {
+        std::vector<xcloud::Title> titles;
+        std::string lookupErr;
+        if (gssv.listTitles(titles, lookupErr, false)) {
+            launchTitleId = resolveCloudLaunchTitleId(titles, game.productId);
+            if (!launchTitleId.empty())
+                XC_LOGI("resolved missing cloud launch ID from Xbox title list for product %s", game.productId.c_str());
+        } else {
+            XC_LOGW("could not resolve cloud launch ID for product %s: %s", game.productId.c_str(), lookupErr.c_str());
+        }
+        // A list match must provide an actual launch ID, not repeat the local
+        // GTA VI library label that triggered this resolution attempt.
+        if (isUnverifiedGtaViLaunchId(game.productId, launchTitleId)) launchTitleId.clear();
+        // Some products expose an XCloudTitleId in the public catalog; use it
+        // only when present and never infer a GSSV ID from the game name.
+        if (launchTitleId.empty() || launchTitleId == "None") {
+            std::map<std::string, xcloud::Product> catalogProducts;
+            std::string catalogErr;
+            const std::string market = gssv.session().market.empty() ? "US" : gssv.session().market;
+            if (xcloud::fetchProducts({game.productId}, market, ui::catalogLanguage(), catalogProducts,
+                                      catalogErr, false)) {
+                launchTitleId = resolveCatalogLaunchTitleId(catalogProducts, game.productId);
+                if (!launchTitleId.empty()) {
+                    XC_LOGI("resolved missing cloud launch ID from Xbox catalog for product %s", game.productId.c_str());
+                }
+            } else {
+                XC_LOGW("Xbox catalog could not resolve cloud launch ID for product %s: %s",
+                        game.productId.c_str(), catalogErr.c_str());
+            }
+        }
+        if (isUnverifiedGtaViLaunchId(game.productId, launchTitleId)) launchTitleId.clear();
+        if (launchTitleId.empty() || launchTitleId == "None") {
+            const std::string reason = "Xbox Cloud and the Xbox catalog did not return a verified launch ID for " + game.name +
+                ". Refresh the game library and try again; if it still fails, send the app log to PBOX Technical Support.";
+            XC_LOGW("%s; the authenticated cloud title list contained %zu entries; refusing to start with an empty or seeded titleId",
+                    reason.c_str(), titles.size());
+            return "ERROR: " + ui::trf(ui::Str::StreamFailed, reason);
+        }
+    }
+    err.clear();
+    std::string streamLocale = ui::gameLocale();
+    {
+        std::lock_guard<std::mutex> lock(g_settingsMutex);
+        bool hasCustom = false;
+        GameProfile prof = g_settings.profileForGame(game.productId, launchTitleId, &hasCustom);
+        if (!prof.locale.empty()) streamLocale = prof.locale;
+        std::string res;
+        if (!g_autoplay.resolution.empty()) {
+            res = g_autoplay.resolution;
+        } else if (g_settings.performanceMode == 1) {
+            res = "720p";
+        } else if (g_settings.performanceMode == 2) {
+            res = "1080p";
+        } else if (hasCustom) {
+            res = prof.resolution == 1 ? "720p" : prof.resolution == 2 ? "best" : "1080p";
+        } else {
+            res = g_settings.resolution;
+        }
+        bool isBest = (res == "best" || res == "1440p");
+        // "Best" asks for the top tier every time, nothing measured or
+        // remembered: the service gives what the plan and the game allow
+        // (1440p where it can, else 1080p). The user's own Xbox always gets
+        // the top tier (it sends 1080p either way, at ~16 Mbps instead of ~9.5).
+        bool home = gssv.isHome();
+        g_probing = false;
+        g_afterProbeAlias.clear();
+        g_tierPicked = false;
+        xcloud::Resolution tier;
+        if (!g_autoplay.resolution.empty())
+            tier = res == "720p"       ? xcloud::Resolution::P720
+                   : res == "1440p"    ? xcloud::Resolution::P1440
+                   : res == "1080p-hq" ? xcloud::Resolution::P1080HQ
+                   : isBest            ? (allow1440Locked() ? xcloud::Resolution::P1440 : xcloud::Resolution::P1080HQ)
+                                       : xcloud::Resolution::P1080HQ;
+        else if (res == "720p")
+            tier = xcloud::Resolution::P720;
+        else if (home)
+            tier = xcloud::Resolution::P1440;
+        else if (res == "1440p" || (isBest && allow1440Locked()))
+            tier = xcloud::Resolution::P1440;
+        else
+            tier = xcloud::Resolution::P1080HQ;
+        gssv.setResolution(tier);
+        gssv.setPreviewFeatures(g_settings.previewFeatures);
+        const xcloud::Region* region = gssv.session().defaultRegion();
+        const std::string& wanted = regionName.empty() ? g_settings.region : regionName;
+        for (const auto& r : gssv.session().regions)
+            if (r.name == wanted) region = &r;
+        if (regionName.empty() && g_settings.region.empty() && region) {
+            std::vector<std::string> available;
+            available.reserve(gssv.session().regions.size());
+            for (const auto& r : gssv.session().regions) available.push_back(r.name);
+            const std::string better = lowestRecentSessionRegion(region->name, available, platform::nowMs());
+            if (!better.empty()) {
+                for (const auto& r : gssv.session().regions) {
+                    if (r.name == better) {
+                        region = &r;
+                        XC_LOGI("auto region: selected %s using recent measured session RTT", r.name.c_str());
+                        break;
+                    }
+                }
+            }
+        }
+        if (region) gssv.setRegion(*region);
+        XC_LOGI("stream settings: %s%s, region %s, locale %s", res.c_str(),
+                hasCustom ? " (per-game)" : "", region ? region->name.c_str() : "?", streamLocale.c_str());
+    }
+    // For a crash marker: what is being started (a console's id stays out).
+    g_stageTitle = launchTitleId;
+    g_stageGameName = game.name;
+    g_stageProduct = game.productId;
+    g_stageXboxTitleId = game.xboxTitleId;
+    g_stageTileUrl = game.tileUrl;
+    if (g_stageXboxTitleId.empty() && !game.productId.empty()) {
+        if (const auto* m = trophy::findKnownTitle("", game.productId)) {
+            g_stageXboxTitleId = m->xboxTitleId;
+            if (g_stageGameName.empty()) g_stageGameName = m->titleName;
+        }
+    }
+    crash::setStage(gssv.isHome() ? "starting own Xbox" : ("starting " + launchTitleId).c_str());
+    if (std::string res = platform::diagnostics(); !res.empty()) XC_LOGI("resources before the stream: %s", res.c_str());
+    int status = 0;
+    bool started = gssv.startSession(launchTitleId, streamLocale, err, &status);
+    if (!started && status == 401 && !g_cancel) {
+        // The token refused before its time: renewed once, asked again.
+        XC_LOGW("%s; renewing the sign-in and asking again", err.c_str());
+        std::string renewErr;
+        if (keepSignedIn(am, gssv, renewErr, true)) started = gssv.startSession(launchTitleId, streamLocale, err, &status);
+        else XC_LOGW("sign-in renewal: %s", renewErr.c_str());
+    }
+    if (!started) {
+        if (err.find("0x87DD043A") != std::string::npos || err.find("MonthlyLimitExceeded") != std::string::npos) {
+            return std::string(ui::tr(ui::Str::MonthlyLimitExceeded));
+        }
+        if (err.find("DeviceTypeNotAllowed") != std::string::npos) {
+            return std::string(ui::tr(ui::Str::DeviceTypeNotAllowed));
+        }
+        return err;
+    }
+    // Do not make launch progress wait on an optional hero-art HTTP request.
+    // Library hydration can populate artwork before the next launch; the live
+    // session status is more useful here than a late image on the loading UI.
+    bool connected = false;
+    bool wasInQueue = false;
+    std::string result = "timed out waiting for the session";
+    // A console that is off for good (not asleep) never comes out of
+    // Provisioning: give up after a minute (the cloud's queue may take long).
+    const uint64_t provisioningSince = platform::nowMs();
+    int pollErrors = 0;
+    // The queue's estimate: the title's (the service has no per-session one),
+    // asked every 15 s and counted down in between; -1 unknown.
+    int queueSeconds = -1;
+    uint64_t queueAskedAt = 0;
+    uint64_t queueStartedAt = 0;
+    for (int i = 0; i < 900 && !g_cancel; ++i) {
+        if (gssv.isHome() && platform::nowMs() - provisioningSince > 60000) {
+            result = "ConsoleDidNotWake: no answer in 60 s";
+            break;
+        }
+        xcloud::SessionStatus st;
+        if (!gssv.sessionState(st, err)) {
+            // A network hiccup (a TLS timeout) is asked again; three in a row end it.
+            if (++pollErrors < 3) {
+                XC_LOGW("%s (asking again)", err.c_str());
+                platform::sleepMs(1000);
+                continue;
+            }
+            result = err;
+            break;
+        }
+        pollErrors = 0;
+        XC_LOGI("session state: %s", st.raw.c_str());
+        if (st.state == xcloud::SessionState::WaitingForResources) {
+            wasInQueue = true;
+            uint64_t now = platform::nowMs();
+            if (!queueStartedAt) queueStartedAt = now;
+            int elapsedSec = static_cast<int>((now - queueStartedAt) / 1000);
+            if (!queueAskedAt || now - queueAskedAt >= 15000) {
+                int s = gssv.titleWaitSeconds(launchTitleId);
+                XC_LOGI("queue: estimated %d s (elapsed %d s)", s, elapsedSec);
+                if (s >= 0 || queueSeconds < 0) queueSeconds = s;
+                queueAskedAt = now;
+            }
+            bool indeterminate = (queueSeconds < 0) || (queueSeconds <= 15 && elapsedSec >= 15);
+            if (indeterminate) {
+                g_ui->setLaunchStatus(ui::trf(ui::Str::InQueueIndeterminate, formatWait(elapsedSec)));
+            } else {
+                int left = std::max(0, queueSeconds - static_cast<int>((now - queueAskedAt) / 1000));
+                g_ui->setLaunchStatus(ui::trf(ui::Str::InQueueEstimated, formatWait(left), formatWait(elapsedSec)));
+            }
+        }
+        if (st.state == xcloud::SessionState::Provisioning && gssv.isHome())
+            g_ui->setLaunchStatus(ui::tr(ui::Str::WakingConsole));  // a sleeping Xbox takes ~10 s
+        if (st.state == xcloud::SessionState::Failed) {
+            if (st.errorCode == "0x87DD043A" || st.errorCode == "MonthlyLimitExceeded" ||
+                st.raw.find("0x87DD043A") != std::string::npos || st.raw.find("MonthlyLimitExceeded") != std::string::npos) {
+                result = ui::tr(ui::Str::MonthlyLimitExceeded);
+            } else {
+                result = "the session failed: " + st.errorCode + " " + st.errorMessage;
+            }
+            break;
+        }
+        if (st.state == xcloud::SessionState::ReadyToConnect && !connected) {
+            std::string transfer;
+            if (!am.consoleTransferToken(transfer, err) || !gssv.connect(transfer, err)) {
+                result = err;
+                break;
+            }
+            connected = true;
+        }
+        if (st.state == xcloud::SessionState::Provisioned) {
+            bool alertOn = false;
+            {
+                std::lock_guard<std::mutex> lock(g_settingsMutex);
+                alertOn = g_settings.queueReadyAlert;
+            }
+            if (alertOn && (wasInQueue || (platform::nowMs() - provisioningSince >= 2000))) {
+                XC_LOGI("session: queue completed and provisioned; triggering queue-ready chime and rumble on DualSense");
+                playQueueReadyAlert(true);
+            }
+            g_ui->setLaunchStatus(ui::tr(ui::Str::StartingStream));
+            result = stream(gssv, am.cloudTimeQuery());
+            failed = result.rfind("ERROR", 0) == 0;
+            break;
+        }
+        platform::sleepMs(1000);
+    }
+    if (g_cancel && failed) {
+        result = "cancelled";
+        failed = false;
+    }
+    gssv.stopSession();
+    return result;
+}
+
+std::string play(auth::AuthManager& am, xcloud::GssvClient& gssv, const ui::GameTile& game, bool& failed,
+                 const std::string& regionName) {
+    // Microsoft serves free-to-play cloud titles from a separate GSSV
+    // offering. The normal xgpuweb title list does not reliably contain them,
+    // which caused Rocket League to fail before session provisioning.
+    if (!game.homeConsole && game.freeInStore && !gssv.isHome()) {
+        std::string err;
+        if (!keepSignedIn(am, gssv, err)) {
+            failed = true;
+            return "ERROR: Could not refresh Xbox sign-in before free-to-play launch: " + err;
+        }
+        xcloud::GssvClient f2p("xgpuwebf2p");
+        f2p.setLoginCountry(gssv.loginCountry());
+        f2p.setResolution(gssv.resolution());
+        f2p.setPreviewFeatures(gssv.previewFeatures());
+        if (!am.loginOffering(f2p, err)) {
+            if (f2p.loginStatus() == 403 && !gssv.isHome()) {
+                XC_LOGW("xCloud denied the free-to-play offering (403); trying the standard offering, which still requires Xbox entitlement");
+                const std::string freeError = err;
+                std::string fallback = playUsingClient(am, gssv, game, failed, regionName);
+                if (!failed) return fallback;
+                return fallback + "\nFree-to-play offering was also denied: " + freeError;
+            }
+            failed = true;
+            XC_LOGW("free-to-play xCloud offering sign-in failed: %s", err.c_str());
+            return "ERROR: Could not sign in to the Xbox free-to-play cloud service: " + err;
+        }
+        XC_LOGI("using xCloud free-to-play offering for %s", game.name.c_str());
+        return playUsingClient(am, f2p, game, failed, regionName);
+    }
+    return playUsingClient(am, gssv, game, failed, regionName);
+}
+
+}  // namespace xc::app
