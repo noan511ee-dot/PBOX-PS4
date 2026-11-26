@@ -17,38 +17,116 @@
 namespace xc::app {
 
 namespace {
+void appendQuoted(std::string& out, std::string_view value) {
+    out += '"';
+    out += json::escape(value);
+    out += '"';
+}
 
-json::Value productToJson(const xcloud::Product& p) {
-    json::Value v = json::Value::object();
-    v.set("xt", p.xcloudTitleId);
-    v.set("xbox", p.xboxTitleId);
-    v.set("title", p.title);
-    v.set("publisher", p.publisher);
-    v.set("description", p.description);
-    v.set("tile", p.tileUrl);
-    v.set("poster", p.posterUrl);
-    v.set("hero", p.heroUrl);
-    json::Value cats = json::Value::array();
-    for (const auto& c : p.categories) cats.push(c);
-    v.set("categories", cats);
+void appendKey(std::string& out, bool& first, std::string_view key) {
+    if (!first) out += ',';
+    first = false;
+    appendQuoted(out, key);
+    out += ':';
+}
+
+void appendStringField(std::string& out, bool& first, std::string_view key, std::string_view value) {
+    appendKey(out, first, key);
+    appendQuoted(out, value);
+}
+
+void appendIntegerField(std::string& out, bool& first, std::string_view key, int64_t value) {
+    appendKey(out, first, key);
+    out += std::to_string(value);
+}
+
+void appendBoolField(std::string& out, bool& first, std::string_view key, bool value) {
+    appendKey(out, first, key);
+    out += value ? "true" : "false";
+}
+
+void appendStringArray(std::string& out, const std::vector<std::string>& values) {
+    out += '[';
+    bool first = true;
+    for (const auto& value : values) {
+        if (!first) out += ',';
+        first = false;
+        appendQuoted(out, value);
+    }
+    out += ']';
+}
+
+void appendStringSet(std::string& out, const std::set<std::string>& values) {
+    out += '[';
+    bool first = true;
+    for (const auto& value : values) {
+        if (!first) out += ',';
+        first = false;
+        appendQuoted(out, value);
+    }
+    out += ']';
+}
+
+void appendItems(std::string& out, const std::vector<std::pair<std::string, std::string>>& items) {
+    out += '[';
+    bool first = true;
+    for (const auto& [productId, titleId] : items) {
+        if (!first) out += ',';
+        first = false;
+        out += "{\"p\":";
+        appendQuoted(out, productId);
+        out += ",\"t\":";
+        appendQuoted(out, titleId);
+        out += '}';
+    }
+    out += ']';
+}
+
+void appendStringMap(std::string& out, const std::map<std::string, std::string>& values) {
+    out += '{';
+    bool first = true;
+    for (const auto& [key, value] : values) {
+        appendKey(out, first, key);
+        appendQuoted(out, value);
+    }
+    out += '}';
+}
+
+void appendProduct(std::string& out, const xcloud::Product& p) {
+    out += '{';
+    bool first = true;
+    appendStringField(out, first, "xt", p.xcloudTitleId);
+    appendStringField(out, first, "xbox", p.xboxTitleId);
+    appendStringField(out, first, "title", p.title);
+    appendStringField(out, first, "publisher", p.publisher);
+    appendStringField(out, first, "description", p.description);
+    appendStringField(out, first, "tile", p.tileUrl);
+    appendStringField(out, first, "poster", p.posterUrl);
+    appendStringField(out, first, "hero", p.heroUrl);
+    appendKey(out, first, "categories");
+    appendStringArray(out, p.categories);
     if (p.detailed) {
-        v.set("d", true);
-        v.set("at", p.detailedAt);
-        v.set("modes", static_cast<int64_t>(p.modes));
-        if (p.plan) v.set("plan", static_cast<int64_t>(p.plan));
-        json::Value langs = json::Value::object();
-        for (const auto& [lang, bits] : p.languages) langs.set(lang, static_cast<int64_t>(bits));
-        v.set("langs", langs);
+        appendBoolField(out, first, "d", true);
+        appendIntegerField(out, first, "at", p.detailedAt);
+        appendIntegerField(out, first, "modes", static_cast<int64_t>(p.modes));
+        if (p.plan) appendIntegerField(out, first, "plan", static_cast<int64_t>(p.plan));
+        appendKey(out, first, "langs");
+        out += '{';
+        bool firstLanguage = true;
+        for (const auto& [language, bits] : p.languages) {
+            appendKey(out, firstLanguage, language);
+            out += std::to_string(static_cast<int>(bits));
+        }
+        out += '}';
     }
     if (!p.ratingAge.empty()) {
-        v.set("rage", p.ratingAge);
-        v.set("rsys", p.ratingSystem);
-        json::Value rdesc = json::Value::array();
-        for (const auto& d : p.ratingDescriptors) rdesc.push(d);
-        v.set("rdesc", rdesc);
+        appendStringField(out, first, "rage", p.ratingAge);
+        appendStringField(out, first, "rsys", p.ratingSystem);
+        appendKey(out, first, "rdesc");
+        appendStringArray(out, p.ratingDescriptors);
     }
-    if (p.isPcOnly) v.set("isPc", true);
-    return v;
+    if (p.isPcOnly) appendBoolField(out, first, "isPc", true);
+    out += '}';
 }
 
 xcloud::Product productFromJson(const std::string& id, const json::Value& v) {
@@ -75,17 +153,6 @@ xcloud::Product productFromJson(const std::string& id, const json::Value& v) {
     p.ratingSystem = v["rsys"].str();
     for (const auto& d : v["rdesc"].items()) p.ratingDescriptors.push_back(d.str());
     return p;
-}
-
-json::Value itemsToJson(const std::vector<std::pair<std::string, std::string>>& items) {
-    json::Value a = json::Value::array();
-    for (const auto& [pid, tid] : items) {
-        json::Value o = json::Value::object();
-        o.set("p", pid);
-        o.set("t", tid);
-        a.push(o);
-    }
-    return a;
 }
 
 }  // namespace
@@ -869,75 +936,94 @@ bool Library::loadCache(bool withLayout) {
 
 void Library::saveCache() const {
     if (cachePath_.empty()) return;
-    json::Value root = json::Value::object();
-    root.set("version", kCacheVersion);
-    root.set("market", market_);
-    root.set("language", language_);
-    json::Value titles = json::Value::array(), prods = json::Value::array();
-    for (const auto& t : ownedTitles_) titles.push(t);
-    for (const auto& p : ownedProducts_) prods.push(p);
-    root.set("ownedTitles", titles);
-    json::Value acqP = json::Value::array(), acqT = json::Value::array();
-    for (const auto& p : acquiredProducts_) acqP.push(p);
-    for (const auto& t : acquiredTitles_) acqT.push(t);
-    root.set("acquiredProducts", acqP);
-    root.set("acquiredTitles", acqT);
-    json::Value recentArr = json::Value::array();
-    for (const auto& r : recent_) recentArr.push(r);
-    root.set("recent", recentArr);
-    root.set("gamePassMember", gamePassMember_);
-    if (!subscription_.empty()) root.set("subscription", subscription_);
-    root.set("ownedProducts", prods);
-    root.set("owned", itemsToJson(owned_));
-    json::Value gamePass = json::Value::array();
-    for (const auto& id : allGames_) gamePass.push(id);
-    root.set("gamePass", gamePass);  // the next start tells the games added since
-    root.set("purchasable", itemsToJson(purchasable_));
-    json::Value layoutArr = json::Value::array();
+    // Keep the existing atomic write, but append the schema directly rather
+    // than retaining a full json::Value tree beside the serialized cache text.
+    // The serialized string is still materialized because writeFileAtomic
+    // accepts a string; this reduces intermediate DOM allocations, not output
+    // buffer memory.
+    std::string out;
+    out.reserve(64 * 1024);
+    out += '{';
+    bool first = true;
+    appendIntegerField(out, first, "version", kCacheVersion);
+    appendStringField(out, first, "market", market_);
+    appendStringField(out, first, "language", language_);
+    auto appendSetField = [&](std::string_view key, const std::set<std::string>& values) {
+        appendKey(out, first, key);
+        appendStringSet(out, values);
+    };
+    auto appendVectorField = [&](std::string_view key, const std::vector<std::string>& values) {
+        appendKey(out, first, key);
+        appendStringArray(out, values);
+    };
+    appendSetField("ownedTitles", ownedTitles_);
+    appendSetField("acquiredProducts", acquiredProducts_);
+    appendSetField("acquiredTitles", acquiredTitles_);
+    appendVectorField("recent", recent_);
+    appendBoolField(out, first, "gamePassMember", gamePassMember_);
+    if (!subscription_.empty()) appendStringField(out, first, "subscription", subscription_);
+    appendSetField("ownedProducts", ownedProducts_);
+    appendKey(out, first, "owned");
+    appendItems(out, owned_);
+    appendKey(out, first, "gamePass");
+    appendStringArray(out, allGames_);  // the next start tells the games added since
+    appendKey(out, first, "purchasable");
+    appendItems(out, purchasable_);
+    appendKey(out, first, "layout");
+    out += '[';
+    bool firstRow = true;
     std::set<std::string> layoutTitles;
     for (const auto& r : layout_) {
         if (!layoutTitles.insert(r.title).second) continue;  // each row once
-        json::Value rowObj = json::Value::object();
-        rowObj.set("title", r.title);
-        rowObj.set("badges", r.badges);
-        rowObj.set("isGrid", r.isGrid);
-        rowObj.set("recent", r.recent);
-        if (!r.siglId.empty()) rowObj.set("siglId", r.siglId);
-        rowObj.set("items", itemsToJson(r.items));
-        layoutArr.push(std::move(rowObj));
+        if (!firstRow) out += ',';
+        firstRow = false;
+        out += '{';
+        bool firstRowField = true;
+        appendStringField(out, firstRowField, "title", r.title);
+        appendBoolField(out, firstRowField, "badges", r.badges);
+        appendBoolField(out, firstRowField, "isGrid", r.isGrid);
+        appendBoolField(out, firstRowField, "recent", r.recent);
+        if (!r.siglId.empty()) appendStringField(out, firstRowField, "siglId", r.siglId);
+        appendKey(out, firstRowField, "items");
+        appendItems(out, r.items);
+        out += '}';
     }
-    root.set("layout", layoutArr);
+    out += ']';
     // Details of everything on the home screen, in "Your games", in the
     // Game Pass catalog, and all catalog products resolved: the next launch
     // shows them without re-fetching, and prevents false-positive new title alerts.
-    json::Value details = json::Value::object();
+    appendKey(out, first, "products");
+    out += '{';
+    bool firstProduct = true;
     for (const auto& [pid, prod] : products_) {
-        details.set(pid, productToJson(prod));
+        appendKey(out, firstProduct, pid);
+        appendProduct(out, prod);
     }
-    root.set("products", details);
+    out += '}';
     std::set<std::string> allKnown = knownProducts_;
     for (const auto& [pid, _] : products_) {
         if (!pid.empty()) allKnown.insert(pid);
     }
-    json::Value kp = json::Value::array();
-    for (const auto& p : allKnown) {
-        if (!p.empty()) kp.push(p);
+    appendKey(out, first, "knownProducts");
+    out += '[';
+    bool firstKnown = true;
+    for (const auto& productId : allKnown) {
+        if (productId.empty()) continue;
+        if (!firstKnown) out += ',';
+        firstKnown = false;
+        appendQuoted(out, productId);
     }
-    root.set("knownProducts", kp);
-    json::Value platforms = json::Value::object(), xboxTitles = json::Value::object(), cloudTitles = json::Value::object();
-    for (const auto& [id, code] : platform_) platforms.set(id, code);
-    for (const auto& [pid, xbox] : xboxTitleOf_) xboxTitles.set(pid, xbox);
-    for (const auto& [pid, title] : cloudTitleOf_) cloudTitles.set(pid, title);
-    root.set("platforms", platforms);
-    root.set("xboxTitles", xboxTitles);
-    root.set("cloudTitles", cloudTitles);
-    json::Value free = json::Value::array();
-    for (const auto& id : freeInStore_) free.push(id);
-    root.set("freeInStore", free);
-    json::Value mkb = json::Value::array();
-    for (const auto& id : mouseKeyboard_) mkb.push(id);
-    root.set("mouseKeyboard", mkb);
-    if (!platform::writeFileAtomic(cachePath_, root.dump())) XC_LOGW("library: could not write %s", cachePath_.c_str());
+    out += ']';
+    appendKey(out, first, "platforms");
+    appendStringMap(out, platform_);
+    appendKey(out, first, "xboxTitles");
+    appendStringMap(out, xboxTitleOf_);
+    appendKey(out, first, "cloudTitles");
+    appendStringMap(out, cloudTitleOf_);
+    appendSetField("freeInStore", freeInStore_);
+    appendSetField("mouseKeyboard", mouseKeyboard_);
+    out += '}';
+    if (!platform::writeFileAtomic(cachePath_, out)) XC_LOGW("library: could not write %s", cachePath_.c_str());
 }
 
 void Library::markAsOwned(const std::string& productId, const std::string& titleId, const std::string& name) {
